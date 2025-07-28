@@ -1,6 +1,5 @@
 ---
 title: Analiza przestępstw w Chicago na przestrzeni lat 2016-2020
-author: Aleksander Jasiński, Mateusz Gilowski, Piotr Otręba
 data: "`r Sys.Date()`"
 output:
   cleanrmd::html_document_clean:
@@ -63,7 +62,7 @@ dane %>% group_by(Primary.Type)%>%summarize(count=n())%>%arrange(desc(count))
 
 Dalsze modyfikacje badanych zmiennych będziemy wykonywać w zależności od potrzeb estymowanego modelu.
 
-# Rodział I: Model regresji liniowej ilości przestępstw, Mateusz Gilowski
+# Rodział I: Model regresji liniowej ilości przestępstw
 
 ## Przygotowanie danych
 
@@ -320,7 +319,7 @@ W tym przypadku: **MAE = 154.15** oznacza, że przeciętnie model myli się o ok
 Zmienna **CrimeCount** jest liczona w setkach, a często nawet tysiącach przestępstw miesięcznie, dlatego wartości błędów bezwzględnych należy interpretować w odpowiednim kontekście.
 Mimo pozornie dużych liczb, błędy te stanowią umiarkowany procent względem ogólnej liczby przestępstw.
 
-# Rozdział II: Szeregi czasowe, Piotr Otręba
+# Rozdział II: Szeregi czasowe
 
 ## Przygotowanie danych
 
@@ -1152,7 +1151,7 @@ ggplot(df, aes(x = Month, y = num_crimes)) +
   )  + guides(linetype = "none")
 ```
 
-# Rozdział III: Regresja logistyczna - kradzież a wtargnięcie na teren prywatny, Aleksander Jasiński
+# Rozdział III: Regresja logistyczna - kradzież a wtargnięcie na teren prywatny
 
 ## Ewaluacja modelu na oryginalnym zbiorze
 
