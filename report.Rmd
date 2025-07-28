@@ -1,0 +1,1530 @@
+---
+title: Analiza przestępstw w Chicago na przestrzeni lat 2016-2020
+author: Aleksander Jasiński, Mateusz Gilowski, Piotr Otręba
+data: "`r Sys.Date()`"
+output:
+  cleanrmd::html_document_clean:
+    theme: water
+    toc: yes
+    toc_depth: 3
+    number_sections: yes
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+Podstawowe biblioteki:
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(forecast)
+library(tseries)
+library(urca)
+library(car)
+library(lubridate)
+library(tibble)
+library(sandwich)
+library(lmtest)
+```
+
+# Obróbka danych
+
+Analiza obejmie podzbiór danych dotyczących przestępczości w Chicago w latach 2016-2020, dane pochodzą z [Bazy Danych Miasta Chicago](https://data.cityofchicago.org/).
+
+```{r}
+dane <- read.csv("2016-2020-chicago-crime.csv", sep=",")
+
+dane %>% 
+  summarize(sum(duplicated(Case.Number)))#mamy 160 duplikatów
+
+
+dane <- dane %>% distinct(Case.Number, .keep_all = TRUE)
+
+```
+
+```{r include=FALSE}
+data <- dane
+```
+
+Rodzaje przestępstw:
+
+```{r}
+dane %>% group_by(Primary.Type)%>%summarize(count=n())%>%arrange(desc(count))
+```
+
+Dalsze modyfikacje badanych zmiennych będziemy wykonywać w zależności od potrzeb estymowanego modelu.
+
+# Rodział I: Model regresji liniowej ilości przestępstw, Mateusz Gilowski
+
+## Przygotowanie danych
+
+Transformuję dane, wyodrębniam miesiąc z daty, zamieniam zmienną District na typ factor oraz usuwam obserwacje z brakującymi wartościami.
+
+```{r}
+data_clean <- data %>%
+  mutate(
+    Date = mdy_hms(Date),
+    Year = year(Date),
+    Month = month(Date),
+    District = as.factor(District)
+  ) %>%
+  filter(!is.na(District))  
+```
+
+Aby możliwe było oszacowanie modelu regresji liniowej, konieczne jest przekształcenie danych, agreguję liczbę przestępstw dla każdego miesiąca i dzielnicy.
+
+```{r}
+monthly_crime <- data_clean %>%
+  group_by(Year, Month, District) %>%
+  summarise(CrimeCount = n(), .groups = "drop")
+monthly_crime
+```
+
+## Wykres: liczba przestępstw w dzielnicach w ujęciu miesięcznym
+
+Dla lepszego zobrazownia przedstawie wykres liczby przestępstw w miesiącach w danych dzielnicach
+
+```{r wykres, fig.width=12, fig.height=6}
+ggplot(monthly_crime, aes(x = interaction(Year, Month, sep = "-"), y = CrimeCount,
+                          color = District, group = District)) +
+  geom_line() +
+  labs(
+    title = "Liczba przestępstw w dzielnicach Chicago (2016–2020, miesięcznie)",
+    x = "Rok-Miesiąc", y = "Liczba przestępstw", color = "Dzielnica"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 6))
+```
+
+W każdej dzielnicy liczba przestępstw wykazuje wyraźną sezonowość (spadki zimą, wzrosty latem, szczególnie widoczne w miesiącach letnich, jak lipiec i sierpień).
+
+Najbardziej przestępcze dystrykty mają powtarzające się, wyższe piki, co może wskazywać na trwałe problemy społeczne lub strukturalne.
+
+Niektóre dystrykty (np. **District 31** ma najniższy poziom) utrzymują bardzo niski poziom przestępczości przez cały okres.
+
+Widoczny nagły spadek we wszystkich dzielnicach na początku 2020 roku jest najpewniej związany z początkiem pandemii COVID-19 i lockdownem.
+
+Dzielę dane na zbiór treningowy (lata 2016–2018) oraz zbiór testowy (lata 2019–2020), który posłuży do oceny skuteczności modelu.
+
+```{r}
+train_data <- monthly_crime %>% filter(Year < 2019)
+test_data <- monthly_crime %>% filter(Year > 2018)
+```
+
+## Model regresji liniowej
+
+Przechodze wiec do modelu regresji liniowej, w którym zmienną objaśnianą bedzie **CrimeCount** - miesięczna liczba przestępstw w danej dzielnicy, a zmiennymi objaśniającymi Month i District jako zmienna jakościowa.
+
+Zmienna **Month** została uwzględniona, ponieważ przestępczość może mieć charakter sezonowy, a więc zmieniać się w zależności od miesiąca roku.
+Natomiast **District** reprezentuje różne jednostki administracyjne miasta Chicago, istnieje silne uzasadnienie, że poziom przestępczości różni się przestrzennie.
+Dlatego oba te czynniki są naturalnymi i istotnymi predyktorami liczby przestępstw.
+Ich bezpośrednie uwzględnienie w modelu, bez wcześniejszej selekcji metodą Hellwiga czy stepwise, wynika z logicznej konieczności ich obecności i z chęci zbudowania modelu predykcyjnego z jasno określoną strukturą.
+
+```{r}
+lm_model <- lm(CrimeCount ~ Month + factor(District), data = train_data)
+summary(lm_model)
+```
+
+Rozrzut reszt od -321 do +447 świadczy o tym, że model nie jest idealny, są obserwacje, których liczba przestępstw różni się od przewidywań nawet o kilkaset, natomiast mediana bliska 0 oznacza, że przeszacowania i niedoszacowania się równoważą.
+Co miesiąc liczba przestępstw **rośnie średnio o ok. 8,25** przypadków.
+Efekt ten jest istotny statystycznie (p \< 0.001).
+To może wskazywać na trend wzrostowy przestępczości w czasie w latach 2016–2018.
+**District 1** jest kategorią referencyjną, czyli wszystkie inne współczynniki mówią, o ile przestępstw więcej lub mniej jest w danej dzielnicy w porównaniu z dzielnicą 1.
+
+Dla przykładu:
+
+-   **District 2:** -273.778 - średnio prawie 274 przestępstwa mniej miesięcznie niż w dzielnicy 1.
+
+-   **District 11:** +307.889 - to najbardziej obciążona przestępstwami dzielnica.
+
+-   **District 31:** -1238.742 - ekstremalnie niskie przestępstwa.
+
+Tylko **District 4 i 18** nie są statystycznie różne (p \> 0.05), czyli mają podobny poziom przestępczości do dzielnicy 1.
+
+Model jest bardzo dobrze dopasowany do danych.
+
+Wysoki współczynnik determinacji **(**$R^2$ = 0,8915) oznacza, że aż **89,15%** zmienności liczby przestępstw można wyjaśnić za pomocą zmiennych Month i District.
+**Skorygowany** $R^2$ (88,84%) nadal potwierdza bardzo dobrą jakość dopasowania, nawet po uwzględnieniu liczby predyktorów.
+Model jest istotny statystycznie jako całość.
+**Test F (F = 280,5, p \< 2.2e-16)** pokazuje, że przynajmniej jedna ze zmiennych istotnie wpływa na zmienną objaśnianą.
+
+Przeciętnie model myli się o około **110** przestępstw.
+To pokazuje, że model daje względnie dokładne prognozy, choć należy liczyć się z pewnym błędem, mogą być miesiące niedoszacowane lub przeszacowane o ponad 300 przestępstw.
+Model pokazał ze czas oraz położenie geograficzne (dzielnica) ma bardzo silny wpływ na liczbę przestępstw.
+
+## Zastosowanie estymatora odpornego (robust)
+
+W analizie regresji liniowej przyjęto klasyczne założenie o homoskedastyczności, czyli stałej wariancji składnika losowego.
+Jednakże w praktyce, zwłaszcza przy danych rzeczywistych, takich jak liczba przestępstw w poszczególnych dzielnicach Chicago, założenie to bywa często naruszone.
+Heteroskedastyczność oznacza naruszenie założenia o stałości wariancji składnika losowego w modelu regresji.
+Oznacza to, że rozproszenie reszt zmienia się w zależności od poziomu jednej lub więcej zmiennych objaśniających.
+Występowanie heteroskedastyczności może prowadzić do zaniżenia klasycznych błędów standardowych estymatorów, co skutkuje zawyżeniem istotności statystycznej predyktorów, a tym samym może prowadzić do błędnych wniosków
+
+Aby uwzględnić tę możliwość i uzyskać bardziej wiarygodne wnioski statystyczne, zdecydowałem się na zastosowanie estymatora odpornego (robust), który koryguje błędy standardowe współczynników regresji przy założeniu istnienia heteroskedastyczności.
+Estymator ten nie zmienia samych wartości współczynników, ale dostosowuje ich wariancję, zapewniając bardziej rzetelną ocenę istotności zmiennych w modelu.
+Dzięki temu możliwa jest pewniejsza interpretacja wyników.
+
+```{r}
+robust_se <- vcovHC(lm_model, type = "HC1")
+robust_results <- coeftest(lm_model, vcov. = robust_se)
+robust_results
+```
+
+Porównując wyniki modelu z **klasycznym OLS** i **HC1**, możemy wyciagnąć wnioski, że:
+
+**Wartości współczynników (Estimate)** są identyczne w obu modelach, co jest zgodne z teorią, metoda HC1 nie zmienia estymatorów, a jedynie sposób szacowania ich błędów standardowych.
+
+**Błędy standardowe (Std. Error)** w modelu robust są częściowo większe, co skutkuje nieco niższymi wartościami statystyk t i wyższymi p-value, ale większość wniosków o istotności pozostaje bez zmian.
+
+Wyjątki:
+
+-   Dla **District 7** p-value wzrosło z 0.00783 do 0.050564, czyli współczynnik znajduje się na granicy istotności.
+
+-   Dla **District 25** p-value wzrosło z 0.00493 do 0.014743, ale pozostaje istotny.
+
+-   Dla **District 4 i 18** (tak jak poprzednio) brak istotności statystycznej.
+
+Ogólny obraz pozostaje zbliżony, zmienna **Month** oraz **większość dzielnic** znacząco wpływają na liczbę przestępstw, choć uwzględnienie heteroskedastyczności wpływa na nieco bardziej konserwatywną ocenę istotności.
+
+## Diagnostyka
+
+Teraz przeprowadze wszytskie testy oraz zrobie wykresy diagnostyczne żeby sprawdzić czy model spelnia załozenia.
+
+### Wykres wizualny
+
+```{r}
+par(mfrow = c(2, 2))
+plot(lm_model)
+```
+
+**Residuals vs Fitted:** Wykres nie pokazuje wyraźnej struktury, jednak widoczne są grupowania punktów i kilka odstających obserwacji – może to świadczyć o problemie z heteroskedastycznością lub niewłaściwym dopasowaniem modelu w niektórych obszarach.
+
+**Q-Q Plot:** Odchylenia od linii prostej na końcach wskazują na to, że reszty nie są idealnie normalne, założenie normalności reszt nie jest w pełni spełnione.
+
+**Scale-Location:** Lekki wzrost wariancji reszt przy rosnących wartościach dopasowanych, możliwe niewielkie naruszenie homoscedastyczności.
+
+**Residuals vs Leverage:** Brak punktów o bardzo wysokiej dźwigni i wpływie, choć kilka obserwacji może mieć umiarkowany wpływ, model nie jest silnie zdominowany przez pojedyncze punkty.
+
+### 1. Normalność reszt - test Shapiro-Wilka
+
+```{r}
+shapiro_test <- shapiro.test(residuals(lm_model))
+shapiro_test
+```
+
+Wartość p-testu **Shapiro-Wilka** przekracza standardowy poziom istotności 5%, nie mamy podstaw do odrzucenia H0 o normalności rozkładu reszt.
+Jednocześnie wykres kwantyl-kwantyl pokazuje pewne odstępstwa od normalności.
+Więc założenie normalności reszt jest spełnione.
+
+### 2. Homoskedastyczność – test Breuscha-Pagana
+
+```{r}
+bp_test <- bptest(lm_model)
+bp_test
+```
+
+Bardzo niskie p-value wskazuje na istotność statystyczną wyniku testu **Breuscha-Pagana**, co oznacza, że należy odrzucić hipotezę zerową o homoskedastyczności reszt.
+Oznacza to, że wariancja reszt nie jest stała — występuje heteroskedastyczność.
+Więc założenie homoskedastyczności nie jest spełnione.
+W związku z tym użycie odpornych błędów standardowych (HC1) jest uzasadnione.
+
+### 3. Współliniowość – VIF
+
+```{r}
+vif_values <- vif(lm_model)
+vif_values
+```
+
+Wszystkie wartości **VIF** są bliskie 1, co oznacza brak istotnej współliniowości pomiędzy zmiennymi niezależnymi.
+Więc nie występuje problem współliniowości.
+Zmienna Month oraz zmienne dla dzielnic są niezależne w sensie liniowym.
+
+### 4. Autokorelacja reszt – Durbin-Watson
+
+```{r}
+dw_test <- durbinWatsonTest(lm_model)
+dw_test
+```
+
+Statystyka **Durbin-Watsona** znacznie odbiega od wartości 2 (idealna przy braku autokorelacji) i wskazuje na silną dodatnią autokorelację reszt.
+Dodatkowo, p-value = 0 oznacza istotność tego wyniku.
+Wniosek: Występuje problem autokorelacji reszt, kolejność obserwacji ma wpływ na reszty modelu.
+Może to prowadzić do błędnych wniosków, szczególnie jeśli dane są czasowe, jak w naszym przypadku, dlatego w dalszej cześci projektu zostanie przeprowadzona analiza ARIMA.
+
+Model regresji liniowej wykazuje bardzo dobre dopasowanie **($R^2$ = 0.89)** i spełnia kluczowe założenia dotyczące normalności rozkładu reszt oraz braku współliniowości pomiędzy zmiennymi.
+Wykryto natomiast istotną heteroskedastyczność oraz autokorelację reszt, co może wpływać na oszacowania wariancji i testy istotności.
+Jednak ze względu na wysoką jakość dopasowania modelu oraz fakt, że współczynniki zostały dodatkowo ocenione z użyciem odpornych (heteroskedastyczno-korelowanych) błędów standardowych, możliwa jest ostrożna interpretacja wyników modelu.
+Przy odpowiednich zastrzeżeniach, wnioski co do kierunku i istotności wpływu zmiennych (takich jak Month i District) można uznać za wiarygodne, pomimo naruszeń założeń klasycznej regresji liniowej (heteroskedastyczność, autokorelacja), zastosowanie robust standard errors pozwala uzyskać bardziej wiarygodne oszacowania błędów i poziomów istotności.
+Należy jednak interpretować wyniki z ostrożnością, pamiętając, że model nie uwzględnia w pełni dynamicznej natury danych (autokorelacji czasowej).
+
+Teraz dla dobrego zobrazowani i porównania przedstawie wyniki dla 10 pierwszych dzilenic miedzy modelami
+
+```{r}
+classic_summary <- summary(lm_model)$coefficients
+robust_summary <- robust_results
+
+comparison <- tibble::tibble(
+  Term = rownames(classic_summary),
+  Estimate = classic_summary[, "Estimate"],
+  `SE Classic` = classic_summary[, "Std. Error"],
+  `p Classic` = classic_summary[, "Pr(>|t|)"],
+  `SE Robust` = robust_summary[, "Std. Error"],
+  `p Robust` = robust_summary[, "Pr(>|t|)"]
+)
+
+head(comparison, 10)
+```
+
+Porównanie błędów standardowych pokazuje, że w modelu z odpornymi błędami standardowymi **(robust SE)** błędy są systematycznie większe niż w klasycznym modelu, np.
+dla **District 2** wzrost z 25.8 do 31.0, a dla **District 5** z 25.8 do 31.9.
+
+W efekcie, p-wartości rosną, choć w większości przypadków zmiana nie wpływa na ogólną interpretację istotności (np. pozostają istotne na poziomie 0.05).
+
+-   **District 6:** klasyczny p = 2.01e-6, po uwzględnieniu heteroskedastyczności p = 1.96e-4 $->$ nadal istotny, ale mniej przekonujący.
+
+-   **District 7:** klasyczny p = 0.00783, a p robust = 0.0506 $->$ na granicy istotności statystycznej, co może mieć wpływ na interpretację tego efektu.
+
+**Wnioski ogólne:** Mimo zmiany dokładności oszacowań, znaki i wartości estymatorów pozostają takie same, co świadczy o stabilności modelu.
+Użycie odpornych błędów standardowych zapewnia bardziej wiarygodne wnioskowanie statystyczne, eliminując ryzyko mylących wyników spowodowanych heteroskedastycznością.
+
+## Predykcja
+
+W niniejszej części pracy przeprowadze proces predykcji wartości zmiennej zależnej na podstawie wytrenowanego modelu regresyjnego.
+Celem było oszacowanie przyszłych obserwacji oraz ocena skuteczności modelu poprzez analizę błędów predykcji.
+Uzyskane wyniki umożliwiają ocenę jakości dopasowania modelu oraz jego potencjalną przydatność w kontekście praktycznym.
+
+```{r}
+predictions <- predict(lm_model, newdata = test_data)
+
+mae <- mean(abs(predictions - test_data$CrimeCount))
+mse <- mean((predictions - test_data$CrimeCount)^2)
+rmse <- sqrt(mse)
+
+round(mae, 2)
+round(rmse, 2)
+
+```
+
+Oba wskaźniki służą do oceny jakości prognoz – im niższe wartości, tym lepsze dopasowanie modelu.
+W tym przypadku: **MAE = 154.15** oznacza, że przeciętnie model myli się o około 154 przestępstwa w każdej prognozie miesięcznej liczby przestępstw dla danej dzielnicy.
+**RMSE = 207.15** jest wyższy od **MAE**, co sugeruje, że istnieją obserwacje z większymi odchyleniami od wartości rzeczywistych, czyli występują pewne bardziej znaczące błędy predykcji.
+Zmienna **CrimeCount** jest liczona w setkach, a często nawet tysiącach przestępstw miesięcznie, dlatego wartości błędów bezwzględnych należy interpretować w odpowiednim kontekście.
+Mimo pozornie dużych liczb, błędy te stanowią umiarkowany procent względem ogólnej liczby przestępstw.
+
+# Rozdział II: Szeregi czasowe, Piotr Otręba
+
+## Przygotowanie danych
+
+Usuwamy nieistotne z punktu widzenia analizy zmienne.
+
+```{r}
+data <- data %>% select( -c("X", "ID", "Case.Number", "Location", "Updated.On")) 
+data <- data %>% rename("Type" = "Primary.Type")
+```
+
+Wyświetlamy unikatowe kategorie przestępstw.
+
+```{r}
+unique(data$Type)
+```
+
+Grupujemy przestępstwa w większe kategorie.
+
+```{r}
+data <- data %>%
+  mutate(Type = case_when(
+    grepl("NON\\s?-\\s?CRIMINAL", Type) ~ "NON-CRIMINAL",
+    grepl("NARCOTIC", Type) ~ "NARCOTICS",
+    .default = Type
+  ))
+```
+
+Podobnie, grupujemy opis lokalizacji, gdzie doszło do przestępstwa.Nazw lokalizacji jest na tyle dużo, że nie będziemy ich wyświetlać w sprawozdaniu.
+
+```{r, include=FALSE}
+unique(data$Location.Description)
+```
+
+```{r}
+data <- data %>%
+  mutate(Location_Category = case_when(
+    # Lokalizacje mieszkalne
+    grepl("RESIDENCE|APARTMENT|CHA APARTMENT|HOUSE|NURSING HOME|RETIREMENT HOME|ROOMING HOUSE|DRIVEWAY - RESIDENTIAL|RESIDENCE-GARAGE|RESIDENCE - GARAGE|RESIDENCE PORCH|RESIDENCE - PORCH|RESIDENTIAL YARD|RESIDENCE - YARD", Location.Description, ignore.case = TRUE) ~ "Residential",
+    
+    # Sklepy, biura, komercja
+    grepl("COMMERCIAL|BUSINESS OFFICE|RETAIL|STORE|DEPARTMENT STORE|SMALL RETAIL|GROCERY|CONVENIENCE STORE|DRUG STORE|PAWN SHOP|TAVERN/LIQUOR|LIQUOR STORE|NEWSSTAND|APPLIANCE STORE|CLEANING STORE|AUTO / BOAT / RV DEALERSHIP", Location.Description, ignore.case = TRUE) ~ "Commercial",
+    
+    # Instytucje finansowe
+    grepl("BANK|CURRENCY EXCHANGE|ATM|SAVINGS AND LOAN|CREDIT UNION", Location.Description, ignore.case = TRUE) ~ "Financial",
+    
+    # Usługi
+    grepl("OFFICE|MEDICAL/DENTAL|MEDICAL / DENTAL|ANIMAL HOSPITAL|BARBERSHOP|BARBER SHOP/BEAUTY SALON", Location.Description, ignore.case = TRUE) ~ "Office/Service",
+    
+    # Związane z taksówkami, samochodami
+    grepl("VEHICLE|CAR WASH|AUTO|TAXICAB|RIDE SHARE|UBER|LYFT|DELIVERY TRUCK|GARAGE/AUTO REPAIR", Location.Description, ignore.case = TRUE) ~ "Vehicle",
+    
+    # Parkingi
+    grepl("PARKING LOT|GARAGE \\(NON|DRIVEWAY", Location.Description, ignore.case = TRUE) ~ "Parking",
+    
+    # Drogi i chodniki publiczne
+    grepl("STREET|HIGHWAY|EXPRESSWAY|SIDEWALK|ALLEY|BRIDGE", Location.Description, ignore.case = TRUE) ~ "Public Roads",
+    
+    # Stacja benzynowa
+    grepl("GAS STATION", Location.Description, ignore.case = TRUE) ~ "Gas Station",
+    
+    # Parki i tereny zielone
+    grepl("PARK PROPERTY|FOREST PRESERVE|WOODED AREA|LAKEFRONT|WATERFRONT|RIVERBANK|RIVER BANK|LAKE|LAGOON", Location.Description, ignore.case = TRUE) ~ "Outdoor Green Areas",
+    
+    # Komunikacja miejska
+    grepl("CTA|TRAIN|BUS|SUBWAY|PLATFORM|OTHER RAILROAD", Location.Description, ignore.case = TRUE) ~ "Public Transit",
+    
+    # Lotnisko
+    grepl("AIRPORT|AIRCRAFT", Location.Description, ignore.case = TRUE) ~ "Airport",
+    
+    # Statki
+    grepl("BOAT|WATERCRAFT", Location.Description, ignore.case = TRUE) ~ "Water/Maritime",
+    
+    # Placówki oświatowe
+    grepl("SCHOOL|COLLEGE|UNIVERSITY", Location.Description, ignore.case = TRUE) ~ "Educational Institutions",
+    
+    # Instytucje federalne
+    grepl("GOVERNMENT|FEDERAL|POLICE|JAIL|LOCK-UP|FIRE STATION", Location.Description, ignore.case = TRUE) ~ "Government/Security",
+    
+    # Służba zdrowia
+    grepl("HOSPITAL|NURSING|RETIREMENT HOME", Location.Description, ignore.case = TRUE) ~ "Healthcare",
+    
+    # Miejsca kultu
+    grepl("CHURCH|SYNAGOGUE|PLACE OF WORSHIP|CEMETARY", Location.Description, ignore.case = TRUE) ~ "Religious",
+    
+    # Rozrywka i rekreacja
+    grepl("RESTAURANT|BAR|TAVERN|CLUB|POOL ROOM|ATHLETIC|SPORTS|STADIUM|MOVIE|THEATER|BOWLING", Location.Description, ignore.case = TRUE) ~ "Indoor Entertainment/Sports",
+    
+    # Hotele
+    grepl("HOTEL|MOTEL", Location.Description, ignore.case = TRUE) ~ "Accommodation",
+    
+    # Tereny przemysłowe / plac budowy
+    grepl("WAREHOUSE|FACTORY|MANUFACTURING|CONSTRUCTION", Location.Description, ignore.case = TRUE) ~ "Industrial",
+    
+    # Wnętrza budynków
+    grepl("HALLWAY|STAIRWELL|VESTIBULE|ELEVATOR|PORCH|BASEMENT|YARD", Location.Description, ignore.case = TRUE) ~ "Building Areas",
+    
+    # Inne
+    grepl("OTHER|SPECIFY", Location.Description, ignore.case = TRUE) ~ "Other",
+    
+    # Nieznane
+    Location.Description == "" ~ "Unknown",
+    
+    # Wszystko inne
+    TRUE ~ "Miscellaneous"
+  ))
+```
+
+## Analiza danych.
+
+Sprawdźmy, gdzie doszło do największej liczby przestępstw.
+
+```{r}
+data %>% 
+  group_by(Location_Category) %>%
+  count() %>% 
+  ggplot(aes(y=reorder(Location_Category, n), x=n)) + 
+  geom_col(fill="lightblue", color="darkblue") + 
+  theme_bw() + 
+  scale_x_continuous(breaks= seq(5e4, 3e5, 5e4), labels = function(x) {x/1000}) +
+  labs(title="Liczba przestępstw według ich lokalizacji",
+       subtitle="Lata 2016-2020",
+       y = "Lokalizacja przestępstwa",
+       x = "Liczba przestępstw (tys.)")
+```
+
+Dla każdej lokalizacji wyświetlamy 3 najczęściej popełniane tam typy przzestępstw.
+
+```{r}
+data %>%
+  group_by(Location_Category, Type) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(Location_Category) %>%
+  slice_max(order_by = count, n = 3)
+```
+
+Wyświetlamy 10 ogółem najczęściej popełnianych przestępstw.
+
+```{r}
+num_crimes <- data %>% group_by(Type) %>% count() %>% arrange(desc(n))
+num_crimes
+```
+
+Najczęściej dokonywanym typem przestępstwa była kradzież, na drugim miejscu pobicie, a na trzecim uszkodzenie mienia.
+Przedstawmy to na wykresie.
+
+```{r}
+num_crimes %>% 
+  head(10) %>%
+  ggplot(aes(y=reorder(Type, n), x=n)) + 
+  geom_col(fill="lightblue", color="darkblue") + 
+  theme_bw() + 
+  scale_x_continuous(breaks= seq(5e4, 3e5, 5e4), labels = function(x) {x/1000}) +
+  labs(title="Liczba przestępstw według ich rodzaju",
+       subtitle="10 najczęściej popełnianych przestępstw",
+       y = "Rodzaj przestępstwa",
+       x = "Liczba przestępstw (tys.)")
+```
+
+Sprawdźmy też najrzadziej popełniane przestępstwa.
+
+```{r}
+num_crimes %>% 
+  tail(20) %>%
+  ggplot(aes(y=reorder(Type, n), x=n)) + 
+  geom_col(fill="lightblue", color="darkblue") + 
+  theme_bw() + 
+  scale_x_continuous(breaks = seq(0, 12000, 3000)) +
+  labs(title="Liczba przestępstw według ich rodzaju",
+       subtitle="20 najrzadziej popełnianych przestępstw",
+       y = "Rodzaj przestępstwa",
+       x = "Liczba przestępstw")
+```
+
+Zobaczmy bardziej szczegółowo, jakie kradzieże były dokonywane.
+
+```{r}
+theft_types <- data %>%
+  filter(Type == "THEFT") %>%
+  group_by(Description) %>%
+  count() %>%
+  arrange(desc(n))
+theft_types
+```
+
+Najwięcej było kradzieży zaklasyfikowanych jako kradzież mienia o wartości nieprzekraczającej 500\$.
+Sprawdzamy, czy występują wartości brakujące.
+
+```{r}
+sapply(names(data), function(col) {sum(is.na(data$col))})
+```
+
+Wartości brakujące nie występują.
+
+Przekształcamy kolumnę z datą i godziną popełnienia przestępstwa.
+
+```{r}
+
+data <- data %>% mutate(Date = as_datetime(Date, format = "%m/%d/%Y %I:%M:%S %p"))
+```
+
+### Liczba przestępstw w zależności od pory dnia.
+
+Tworzymy ramkę danych zawierającą liczbę przestępstw danego typu pogrupowanych wg godziny.
+
+```{r}
+crimes_by_hour <- data %>%
+  mutate(hour = hour(Date)) %>%
+  group_by(hour) %>%
+  summarize(num_crimes = n())
+
+
+  
+ggplot(crimes_by_hour, aes(x=hour, y=num_crimes)) + 
+  geom_smooth(method="loess", formula= y~x, alpha=0.25, color="darkgray") + 
+  geom_point(color = "blue") + 
+  scale_y_continuous(breaks = seq(0, 8e4, 2e4), labels = function(x) x/1000) + 
+  expand_limits(y=0) + 
+  scale_x_continuous(breaks = seq(0, 23, 2), labels = function(x) paste(x, "00", sep=":")) + 
+  labs(title = "Liczba przestępstw w ciągu dnia",
+       subtitle = "Lata 2016-2020",
+       x = "Godzina",
+       y = "Liczba przestępstw (tys.)") + 
+  theme_bw()
+  
+```
+
+Najwięcej przestępstw (prawie 80 tys.) ma miejsce w godzinach południowych.
+Wiele przestępstw, bo około 70 tys., jest także popełnianych w godzinach popołudniowych i wczesnym wieczorem (15:00-19:00).
+
+Sprawdźmy, czy różne przestępstwa są popełniane częściej o określonych porach dnia.
+
+```{r}
+crime_types_by_hour <- data %>%
+  mutate(hour = hour(Date)) %>%
+  group_by(hour, Type) %>%
+  count()
+
+crime_types_by_hour %>%
+filter(Type %in% c("THEFT", "BATTERY", "ASSAULT", "CRIMINAL DAMAGE", "DECEPTIVE PRACTICE")) %>%
+ggplot(aes(x=hour, y=n, color= Type)) + 
+  geom_smooth(method="loess", formula= y~x, alpha=0.25, se=F) + 
+  geom_point() + 
+  scale_y_continuous(breaks = seq(0, 2e4, 5e3), labels = function(x) x/1000) + 
+  expand_limits(y=0) + 
+  scale_x_continuous(breaks = seq(0, 23, 2), labels = function(x) paste(x, "00", sep=":")) + 
+  labs(title = "Liczba przestępstw w ciągu dnia",
+       subtitle = "Lata 2016-2020",
+       x = "Godzina",
+       y = "Liczba przestępstw (tys.)",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw()
+```
+
+Najwięcej kradzieży ma miejsce w godz.
+14:00-18:00.
+W przypadku pobicia i uszkodzenia mienia od godzin porannych następuje stopniowy wrost liczby tych przestępstw.
+W przypadku nieuczciwych praktyk najwięcej zdarzeń występuje w godz.
+11:00-13:00.
+W godzinach wczesnoporannych i późnym wieczorem przestępstw tego typu jest znacznie mniej.
+Zapewne wynika to z faktu, że wiążą się one z handlem, a sklepy w tych godzinach są zamknięte.
+
+Podobnie zwizualizujemy jeszcze inne przestępstwa, do których dochodziło rzadziej.
+
+```{r}
+crime_types_by_hour %>%
+  filter(Type %in% c("PROSTITUTION", 
+                     "ARSON", "PUBLIC PEACE VIOLATION", "INTERFERENCE WITH PUBLIC OFFICER", "SEX OFFENSE")) %>%
+  ggplot(aes(x=hour, y=n, color= Type)) + 
+  geom_point() + 
+  geom_line(linewidth=1.1, alpha=0.7) + 
+  scale_y_continuous(limits = c(0,1000)) + 
+  expand_limits(y=0) + 
+  scale_x_continuous(breaks = seq(0, 23, 2), labels = function(x) paste(x, "00", sep=":")) + 
+  labs(title = "Liczba przestępstw w ciągu dnia",
+       subtitle = "Lata 2016-2020",
+       x = "Godzina",
+       y = "Liczba przestępstw",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw() + 
+  theme(legend.position = c(0.6, 0.75),
+        legend.background = element_rect(fill = "transparent", color = NA),
+        legend.box.background = element_rect(fill = "transparent", color = NA))  
+```
+
+Przestępstwa na tle seksualnym mają miejsce najczęściej w okolicach północy.
+Liczba przestępstw polegających na zakłócaniu pracy funkcjonariusza publicznego stopniowo wzrasta od godzin porannych, osiągając maksimum w godzinach wieczornych.
+Najwięcej przypadków prostytucji odnotowano w godzinach 20:00-21:00.
+Podpaleń było niewiele, ale widzimy wzrost liczby tych przestępstw w godzinach nocnych.
+
+```{r}
+crime_locations_by_hour <- data %>%
+  mutate(hour = hour(Date)) %>%
+  group_by(hour, Location_Category) %>%
+  count()
+
+crime_locations_by_hour %>%
+filter(Location_Category%in% c("Residential", "Commercial", "Public Roads")) %>%
+ggplot(aes(x=hour, y=n, color= Location_Category)) + 
+  geom_smooth(method="loess", formula= y~x, alpha=0.25, se=F) + 
+  geom_point() + 
+  scale_y_continuous(breaks = seq(0, 2e4, 5e3), labels = function(x) x/1000) + 
+  expand_limits(y=0) + 
+  scale_x_continuous(breaks = seq(0, 23, 2), labels = function(x) paste(x, "00", sep=":")) + 
+  labs(title = "Liczba przestępstw w ciągu dnia",
+       subtitle = "Lata 2016-2020",
+       x = "Godzina",
+       y = "Liczba przestępstw (tys.)",
+       color = "Lokalizacja przestępstwa") + 
+  theme_bw()
+```
+
+Liczba przestępstw / wykroczeń dokonywanych w rejonach mieszkalnych i na publicznych ulicach / chodnikach była wyraźnie najniższa wczesnym rankiem.
+Najwięcej przestępstw w rejonach mieszkalnych dokonywano między północą a 1 w nocy oraz w południe - wtedy mieszkańców prawdopodobnie nie ma w domu.
+Przestępstw na ulicach najwuęcej było między 19:00 a 20:00.
+
+```{r}
+crime_locations_by_hour %>%
+filter(Location_Category%in% c("Educational Institutions", "Public Transit", "Indoor Entertainment/Sports")) %>%
+ggplot(aes(x=hour, y=n, color= Location_Category)) + 
+  geom_line(linewidth=1.1, alpha=0.5) + 
+  geom_point() + 
+  expand_limits(y=0) + 
+  scale_x_continuous(breaks = seq(0, 23, 2), labels = function(x) paste(x, "00", sep=":")) + 
+  labs(title = "Liczba przestępstw w ciągu dnia",
+       subtitle = "Lata 2016-2020",
+       x = "Godzina",
+       y = "Liczba przestępstw",
+       color = "Lokalizacja przestępstwa") + 
+  theme_bw()
+```
+
+Przestępstwa w miejscach służących rekreacji i rozrywce mają miejsce najczęściej w godzinach 12:00-14:00, choć wieczorem wciąż utrzymują się na relatywnie wysokim poziomie.
+Najwięcej przestępstw w transporcie publicznym jest popełnianych między 17 a 18:00, kiedy ludzie wracają z pracy.
+Liczba przestępstw w placówkach edukacyjnych jest największa w godzinach, gdy zazwyczaj odbywają się lekcje / wykłady, czyli między 11:00 a 16:00.
+
+### Liczba przestępstw w zależności od dnia tygodnia.
+
+Na podstawie daty wyznaczamy dni tygodnia.
+
+```{r}
+data$Weekday <- factor(weekdays(data$Date), 
+                        levels= c("poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"))
+```
+
+Wyznaczamy liczby przestępstw danego rodzaju w zależności od dni tygodnia.
+
+```{r}
+crimes_by_weekday <- data %>%
+  group_by(Weekday, Type) %>%
+  summarize(num_crimes = n(), .groups="drop")
+
+crimes_by_weekday %>%
+  filter(Type %in% c("THEFT", "BATTERY", "CRIMINAL DAMAGE", "DECEPTIVE PRACTICE")) %>%
+ggplot(aes(x=Weekday, y=num_crimes, color=Type, group=Type)) + 
+  geom_point() + 
+  geom_line(size=1.1, alpha=0.5) + 
+  scale_y_continuous(breaks = seq(0, 4e4, 1e4), labels = function(x) x/1000) + 
+  expand_limits(y=0) + 
+  labs(title = "Liczba przestępstw w zależności od dnia tygodnia",
+       subtitle = "Lata 2016-2020",
+       x = "Dzień tygodnia",
+       y = "Liczba przestępstw (tys.)",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw()
+```
+
+Liczba kradzieży oraz nieuczciwych praktyk spada w weekendy.
+Wzrastają natomiast liczby pobić i nieznacznie wzrasta liczba zgłoszeń uszkodzeń mienia.
+
+```{r}
+crimes_by_weekday %>%
+  filter(Type %in% c("PROSTITUTION", 
+                     "ARSON", "PUBLIC PEACE VIOLATION",
+                     "INTERFERENCE WITH PUBLIC OFFICER",
+                      "OFFENSE INVOLVING CHILDREN")) %>%
+  ggplot(aes(x=Weekday, y=num_crimes, color= Type, group=Type)) + 
+  scale_x_discrete(labels = c("pon", "wt", "śr", "czw", "pt", "sob", "nd")) +
+  geom_point() + 
+  geom_line(size=1.1, alpha=0.7) + 
+  expand_limits(y=0) + 
+  labs(title = "Liczba przestępstw w zależności od dnia tygodnia",
+       subtitle = "Lata 2016-2020",
+       x = "Dzień tygodnia",
+       y = "Liczba przestępstw",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw()
+```
+
+W piątki zwyżkuje liczba przestępstw z udziałem nieletnich.
+W niedziele odnotowano więcej przypadków zakłóceń porządku publicznego.
+Najwięcej zgłoszonych przypadków prostytucji było w tygodniu, a w weekendy ta liczba malała.
+
+```{r}
+crime_locations_by_weekday <- data %>%
+  group_by(Weekday, Location_Category) %>%
+  summarize(num_crimes = n(), .groups= "drop")
+
+crime_locations_by_weekday %>%
+  filter(Location_Category %in% c("Residential", "Commercial", "Public Roads")) %>% 
+  ggplot(aes(x=Weekday, y=num_crimes, color= Location_Category, group=Location_Category)) + 
+  geom_point() + 
+  scale_y_continuous(breaks = seq(0, 7e4, 1e4), labels = function(x) x/1000)+
+  geom_line(size=1.1, alpha=0.7) + 
+  expand_limits(y=0) + 
+  labs(title = "Liczba przestępstw w zależności od dnia tygodnia",
+       subtitle = "Lata 2016-2020",
+       x = "Dzień tygodnia",
+       y = "Liczba przestępstw (tys.)",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw()
+  
+```
+
+W weekendy odnotowujemy niewielki wzrost liczby przestępstw na drogach i chodnikach publicznych.
+
+```{r}
+
+crime_locations_by_weekday %>%
+  filter(Location_Category %in% c("Educational Institutions", "Public Transit", "Parking",
+                                  "Indoor Entertainment/Sports", "Financial")) %>% 
+  ggplot(aes(x=Weekday, y=num_crimes, color= Location_Category, group=Location_Category)) + 
+  geom_point() + 
+  geom_line(size=1.1, alpha=0.7) + 
+  expand_limits(y=0) + 
+  labs(title = "Liczba przestępstw w zależności od dnia tygodnia",
+       subtitle = "Lata 2016-2020",
+       x = "Dzień tygodnia",
+       y = "Liczba przestępstw",
+       color = "Lokalizacja przestępstwa") + 
+  theme_bw()
+```
+
+W weekendy drastycznie spada liczba przestępstw w placówkach edukacyjnych, istotny spadek widać wtedy także dla przestępstw popełnianych na parkingach.
+Trochę mniej przestępstw jest popełnianych w weekendy w placówkach finansowych (banki, bankomaty, kantory).
+W obiektach sportowych i służących rozrywce maksymalną liczbę przestępstw odnotowuje się z kolei w soboty.
+
+### Przeciętna liczba przestępstw w ciągu roku.
+
+```{r}
+crime_types_by_day <- data %>%
+  mutate(year_day = yday(Date)) %>%
+  group_by(year_day, Type) %>%
+  summarize(num_crimes = n(), .groups = "drop")
+
+crime_types_by_day  %>%
+  mutate(year_day = as.Date(year_day, origin = "2020-01-01")) %>% # wykres nie przedstawia roku 2020 tylko sumę ze wszystkich lat
+  filter(Type %in% c("THEFT", "BATTERY", "CRIMINAL DAMAGE", "DECEPTIVE PRACTICE")) %>%
+ggplot(aes(x=year_day, y=num_crimes, color=Type, group=Type)) + 
+  geom_point(alpha=0.5) + 
+  geom_line(size=1.1, alpha=0.5) +
+  scale_x_date(breaks = seq(as.Date("2020-01-15"), as.Date("2020-12-30"), by = "1 month"),
+    labels = function(x) format(x, "%b") ) +
+  scale_y_continuous(breaks = seq(0, 1000, 250)) +
+  expand_limits(y=0) + 
+  labs(title = "Liczba przestępstw w ciągu roku",
+       subtitle = "Lata 2016-2020",
+       x = "Dzień tygodnia",
+       y = "Liczba przestępstw (tys.)",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw() + 
+  theme(legend.position = "bottom")
+```
+
+Widzimy wzrost liczby kradzieży w miesiącach wakacyjnych, z najwyższą liczbą kradzieży odnotowywaną na końcu lipca - początku sierpnia.
+Wyższe temperatury powodują zapewne, że więcej osób jest na ulicach, co stwarza okazje dla kieszonkowców.
+Liczba pobić także wzrasta w cieplejszych miesiącach, choć wzrost nie jest tak duży, jak w przypadku kradzieży.
+Ciekawy jest też wyraźnie widoczny pik w liczbie nieuczciwych praktyk widoczny na początku każdego miesiąca.
+
+### Przestępstwa - jak zmieniały się na przestrzeni lat 2016-2020?
+
+Teraz przejdziemy do analizy liczby przestępstw w czasie.
+
+```{r, warning=FALSE}
+
+# przestępstwa pogrupowane na miesiące kolejnych lat
+crimes_by_month_year <- data %>%
+  mutate(Month = my(paste(month(Date), year(Date), sep="-"))) %>%
+  group_by(Month, Type) %>%
+  summarize(num_crimes = n(), .groups = "drop")
+
+# przestępstwa pogrupowane wg numeru tygodnia (bez roku)
+crimes_by_week <- data %>%
+  mutate(Week = week(Date)) %>%
+  group_by(Week,  Type) %>%
+  summarize(num_crimes = n(), .groups = "drop", )
+
+# przestępstwa pogrupowane wg daty
+crimes_by_date <- data %>%
+  mutate(Date = date(Date)) %>%
+  group_by(Date, Type) %>%
+  summarize(num_crimes = n(), .groups = "drop") 
+
+# przestępstwa pogrupowane wg numeru tygodnia i roku - domyślnie z datą odpowiadającą poniedziałkowi danego tyg.
+crimes_by_week_year <- data %>%
+  mutate(
+  week = isoweek(Date),
+  year = isoyear(Date)
+) %>%
+  group_by(week, year, Type) %>%
+  summarize(num_crimes = n(), .groups = "drop") %>%
+  mutate(week_year = as.Date(paste(year, week, 1, sep = "-"), format = "%Y-%W-%u")) %>% arrange(week_year)
+
+# przestępstwa pogrupowane wg daty i godziny
+crimes_by_date_hour <- data %>%
+  mutate(date_hour = ymd_h(paste(date(Date), hour(Date), sep=", "))) %>%
+  group_by(date_hour, Type) %>%
+  summarize(num_crimes = n(), .groups = "drop")
+```
+
+Spróbujemy zwizualizować szereg czasowy - dla kilku wybranych typów przestępstw policzymy tygodniowe liczby zgłoszeń.
+
+```{r, warning=F}
+crimes_by_week_year %>%  
+  filter(Type %in% c("THEFT", "BATTERY", "CRIMINAL DAMAGE", "DECEPTIVE PRACTICE")) %>%
+  ggplot(aes(x=week_year, y=num_crimes, color=Type)) + 
+  geom_line(size=0.75, alpha=0.75) + 
+  scale_x_date(breaks = as.Date("2016-01-01") %m+% months(seq(0, 60, 6)), 
+               labels = function(x) format(x, "%Y-%m") ) +
+  labs(title = "Tygodniowa liczba przestępstw danego typu w czasie",
+       x = "Data", 
+       y = "Liczba przestępstw",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw() + 
+  theme(legend.position = "bottom")
+```
+
+Z wykresu wynika, że prawdopodobnie liczba przestępstw charakteryzuje się sezonowością -
+
+```{r}
+crimes_by_date %>%  
+  filter(Type %in% c("ROBBERY", "MOTOR VEHICLE THEFT", 
+                     "ASSAULT", "NARCOTICS", "BURGLARY", 
+                     "CRIMINAL DAMAGE")) %>%
+  ggplot(aes(x=Date, y=num_crimes, color=Type)) + 
+  geom_line(size=0.75, alpha=0.75) + 
+  scale_x_date(breaks = seq(as.Date("2016-01-01"), as.Date("2021-01-01"), by="12 months"),
+               labels = function(x) format(x, "%Y")) +
+  facet_wrap(~Type, scale="free", ncol=3) + 
+  labs(title = "Dzienna liczba przestępstw danego typu w czasie",
+       x = "Data", 
+       y = "Liczba przestępstw",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw() + 
+  theme(legend.position = "bottom")
+```
+
+W okolicach 1 kwartału 2020 roku widzimy mocny spadek liczby przestępstw związanych z narkotykami.
+Być może było to spowodowane zamknięciem granic USA w związku z pandemią i trudniejszym nielegalnym importem narkotyków.
+Dla rabunków (robbery) i włamań (burglary), a także dla zniszczenia mienia (criminal damage) i kradzieży pojazdów widoczny jest ewidentny pik w okolicach końca 1 połowy 2020 roku.
+Przyjrzyjmy się bliżej temu fragmentowi szeregu czasowego.
+
+```{r}
+crimes_by_date %>%  
+  filter(Date >= "2020-05-15", Date <= "2020-06-01") %>%
+  filter(Type %in% c("ROBBERY", "MOTOR VEHICLE THEFT", "ASSAULT", "NARCOTICS", "BURGLARY", "CRIMINAL DAMAGE")) %>%
+  ggplot(aes(x=Date, y=num_crimes, color=Type)) + 
+  geom_line(size=0.75, alpha=0.75) + 
+  scale_x_date(breaks = seq(as.Date("2020-05-15"), as.Date("2020-06-01"), by="5 days"),
+               labels = function(x) format(x, "%m.%d")) +
+  facet_wrap(~Type, scale="free") + 
+  labs(title = "Dzienna liczba przestępstw danego typu w czasie",
+       subtitle = "2 poł. maja 2020 roku",
+       x = "Data", 
+       y = "Liczba przestępstw",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw() + 
+  theme(legend.position = "bottom")
+```
+
+Pik wystąpił w dniu 31.05.2020.
+25 maja świat obiegła informacja o zamordowaniu George Floyda przez amerykańskiego policjanta, w następnych dniach miała miejsce seria protestów.
+W Chicago największe demonstracje i zamieszki były właśnie 31 maja, miasto odnotowało wtedy 65 tys.
+telefonów na 911, w porównaniu ze średnią dzienną liczbą 15 tys.
+
+Aby lepiej zobaczyć zmiany liczby przestępstw w czasie, zwizualizujemy dane obejmujące lata 2016-2019 (brak wpływu pandemii i brak obserwacji odstającej z 31 maja).
+
+```{r}
+crimes_by_date %>%  
+  filter(Type %in% c("ROBBERY", "THEFT", "ASSAULT", "NARCOTICS", "BURGLARY", "CRIMINAL DAMAGE")) %>%
+  filter(Date <= "2019-12-31") %>%
+  ggplot(aes(x=Date, y=num_crimes, color=Type)) + 
+  geom_line(size=0.75, alpha=0.75) + 
+  scale_x_date(breaks = seq(as.Date("2016-01-01"), as.Date("2021-01-01"), by="12 months"),
+               labels = function(x) format(x, "%Y")) +
+  facet_wrap(~Type, scale="free") + 
+  labs(title = "Dzienna liczba przestępstw danego typu w czasie",
+       x = "Data", 
+       y = "Liczba przestępstw",
+       color = "Rodzaj przestępstwa") + 
+  theme_bw() + 
+  theme(legend.position = "bottom")
+```
+
+Wygląda na to, że dla niektórych typów przestępstw (napaść, włamanie, zniszczenie mienia czy rabunek) występuje sezonowość - więcej zgłoszeń latem.
+
+```{r}
+# dane do modelu
+arima_data <- crimes_by_month_year %>%
+  group_by(Month) %>%
+  summarize(num_crimes = sum(num_crimes))
+```
+
+## Budowa modelu - ARIMA / SARIMA
+
+Celem tej części projektu będzie zbudowanie modelu ARIMA w celu zaprognozowania miesięcznej łącznej liczby przestępstw popełnionych w Chicago.
+Model możemy schematycznie zapisać jako:
+
+$ARIMA(p, d, q)$, gdzie $(p, d, q)$, to parametry części niesezonowej - odpowiadające odpowiednio za autokorelację (AR), opóźnienie (I, liczbę różnic wymaganych do uczynienia szeregu stacjonarnym) i średnią ruchomą (MA).
+
+Bardziej matematyczny zapis modelu to: $y_t' = c + \phi_1 y_{t-1}' + \phi_2 y_{t-2}' + \dots + \phi_p y_{t-p}' + \varepsilon_t - \theta_1 \varepsilon_{t-1} - \dots - \theta_q \varepsilon_{t-q}$, gdzie $y_t'$ to wartość szeregu zróżnicowanego $d$ razy, $\phi_1... \phi_p$ to parametry części autoregresyjnej, $\theta_1... \theta_q$ to parametry części średniej ruchomej.
+
+Jeśli w modelu uwzględniamy sezonowość, to wówczas schematyczny zapis jest następujący: $SARIMA(p, d, q)(P, D, Q)_m$, gdzie $(p, d, q)$ to parametry części niesezonowej (jak wyżej), a $(P, D, Q)$ to analogiczne parametry części sezonowej.
+$m$ odpowiada za długość okresu (dla okresu rocznego i szeregu miesięcznego $m$=12).
+
+### Stacjonarność
+
+Najpierw zajmijmy się kwestią stacjonarności szeregu czasowego.
+Jednym ze sposobów jej zweryfikowania jest rozszerzony test Dickeya-Fullera.
+$H_0$: szereg czasowy jest niestacjonarny; $H_1$: szereg czasowy jest stacjonarny.
+
+```{r, warning=FALSE}
+
+# funkcja do przeprowadzania rozszerzonego testu Dickey'a - Fullera
+test_stationarity_adf <- function(df, colname) {
+    test <- adf.test(df[[colname]])
+    return (data.frame(statystyka = round(test$statistic,2),
+                pvalue = round(test$p.value,2)))
+  
+}
+
+test_stationarity_adf(arima_data, "num_crimes")
+```
+
+Otrzymana p-wartość jest w rzeczywistości mniejsza od 0.01.
+R wyświetla ją jednak jako 0.01 z uwagi na fakt, że niskie wartości statystyki testowej nie są stablicowane i w związku z tym nie można podać dokładnej p-wartości (informuje o tym ostrzeżenie, które zostało wyciszone).
+
+To, czy szereg czasowy jest stacjonarny, można też zbadać za pomocą testu Kwiatkowskiego-Phillipsa-Schmidta-Shina.
+W tym teście hipotezy są przeciwne do tych w teście ADF.
+A zatem: $H_0$: szereg jest stacjonarny; $H_1$: szereg nie jest stacjonarny.
+
+```{r}
+# funkcja do przeprowadzania testu KPSS
+test_stationarity_kpss <- function(df, colname) {
+    test <- kpss.test(df[[colname]]) 
+    
+    stat <- round(test$statistic, 3)
+  
+    return(data.frame(
+      statystyka = stat,
+      wart_krytyczna = 0.463
+    ))
+}
+test_stationarity_kpss(arima_data, "num_crimes")
+```
+
+Obliczona wartość statystyki przewyższa wartość krytyczną - zatem przyjmujemy $H_1$ o niestacjonarności.
+Sytuacja, w której wyniki obu testów nie są zbieżne, nie jest nietypowa.
+W takiej sytuacji uznajemy szereg za niestacjonarny i obliczamy pierwsze różnice: $y_t - y_{t-1}$ w celu uzyskania stacjonarności.
+
+```{r}
+stationary <- arima_data %>%
+  mutate(diff_crimes = c(NA, diff(num_crimes))) %>%
+  filter(!is.na(diff_crimes))
+```
+
+Ponownie przeprowadzamy test Dickey'a Fullera i test KPSS w celu zweryfikowania, czy po takiej transformacji szereg jest już stacjonarny.
+
+```{r}
+test_stationarity_adf(stationary, "diff_crimes")
+```
+
+W teście Dickey'a Fullera bez zmian - różnicowanie daje podstawy do przyjęcia $H_1$ o stacjonarności.
+
+```{r}
+test_stationarity_kpss(stationary, "diff_crimes")
+```
+
+Teraz również w teście KPSS nie ma podstaw do odrzucenia $H_0$ ($H_0$ - szereg jest stacjonarny, odwrotnie niż w teście ADF).
+Wnioskujemy zatem, że pierwsze różnice pozwoliły wyeliminować niestacjonarność.
+W związku z tym parametr $d$ w modelu ARIMA będzie równy 1.
+
+### PACF i ACF
+
+Następnym etapem jest sprawdzenie autokorelacji.
+Posłużą do tego dwa wykresy, wykres autokorelacji (ACF) i wykres autokorelacji częściowej (PACF).
+Pozwolą one ustalić wstępną postać modelu ARIMA.
+Oczywiście wykresy sporządzamy już dla stacjonarnego szeregu różnic.
+
+```{r}
+ggtsdisplay((stationary[["diff_crimes"]]),
+main = "Monthly Differenced Time Series")
+```
+
+Istotny pik dla opóźnienia 2 w ACF sugeruje parametr q=2 (q odpowiada za komponent średniej ruchomej).
+Piki dla dla opóźnień 2 i 4 w PACF sugerują parametr p=2 lub p=4 (p odpowiada za komponent autokorelacji).
+Obliczone zostały pierwsze różnice, dlatego d=1.
+Wstępnie przetestujemy zatem niesezonowe modele ARIMA z tymi parametrami.
+
+Dodatkowo w ACF istotny jest też pik dla opóźnienia 6, 12 i 18-miesięcznego, co sugeruje sezonowość - spróbujemy z parametrem Q=1 dla okresu (cyklu) 6 i 12 miesięcznego.
+W PACF występują też piki dla 6 i (na granicy istotności) 12-miesięcznego opóźnienia, które mógłyby odpowiadać parametrowi P=1 dla okresu odpowiednio 6 i 12 miesięcznego.
+
+Przetestujemy wszystkie kombinacje parametrów (dla modelu bez sezonowości i z jej uwzględnieniem - model SARIMA).
+Modele będą trenowane na szeregu czasowym obejmującym lata 2016-2018.
+Zbiór testowy będzie obejmował rok 2019 (roku 2020 nie uwzględniamy z uwagi na gwałtowny spadek przestępczości po wybuchu pandemii - jego uwzględnienie wpłynęłoby na testowe AIC i RMSE).
+
+### Estymacja modelu ARIMA / SARIMA
+
+```{r}
+# parametry dla modelu ARIMA(p, d, q) - bez sezonowości 
+without_seasonality <- expand.grid(p=c(2, 4, 6), d = 1, q=2, P =0,D = 0, Q =0, period=0)
+
+# parametry dla modelu SARIMA(p, d, q)(P, D, Q) - z komponentem sezonowym
+with_seasonality <- expand.grid(p=c(2,4), d=1, q=2, P=c(0,1), D=c(0,1), Q=c(0, 1), period=c(6, 12))
+
+# ramka danych z testowanymi kombinacjami parametrów
+params <- rbind(with_seasonality, without_seasonality)
+
+# podział na dane treningowe i testowe
+train_data <- arima_data[year(arima_data$Month) %in% 2016:2018,][["num_crimes"]]
+test_data <- arima_data[year(arima_data$Month) %in% 2019:2020,][["num_crimes"]]
+
+# horyzont predykcji - roczny (czyli predykcja dla roku 2019 - nie 2020 przez wzgląd na pandemię)
+h <- 12
+
+results <- do.call(rbind, apply(params, 1, function(param_set){
+  p <- param_set["p"]
+  q <- param_set["q"]
+  d <- param_set["d"]
+  P <- param_set["P"]
+  Q <- param_set["Q"]
+  D <- param_set["D"]
+  period = param_set["period"]
+  
+  model <- Arima(train_data, order= c(p, d, q), seasonal = list(order= c(P, D, Q), period=period ),  )
+  result <- data.frame(p=p, d=d, q=q, P = P, D = D, Q =Q, period = period,
+    AIC = model$aic,
+    train_RMSE = sqrt(mean((train_data - fitted(model))^2)),
+    test_RMSE = sqrt(mean((test_data[1:h] - forecast(model, h)$mean)^2)))
+  }
+))
+
+results <- results %>% arrange(test_RMSE)
+results
+```
+
+Widzimy, że modele SARIMA uwzględniające sezonowość (niezerowe parametry P lub Q) osiągają niższe testowe RMSE od zwykłych modeli ARIMA.
+Spośród przetestowanych kombinacji parametrów, testowe RMSE minimalizuje model $SARIMA(4,1,2)(1,0,0)_{12}$.
+Zauważmy jednak, że model $SARIMA(4,1,2)(0,1,1)_{12}$ ma testowe RMSE większe o jedynie około 8 jednostek, a jego AIC i treningowe RMSE są istotnie niższe (600 vs 391 dla AIC i 857 vs 547 dla treningowego RMSE).
+Mając to na uwadze, za najlepszy model uznajemy właśnie ten drugi: $SARIMA(4,1,2)(0,1,1)_{12}$.
+Wyświetlmy informacje o tym modelu.
+
+```{r}
+model <- Arima(train_data, order= c(4, 1, 2), seasonal = list(order= c(0, 1, 1), period=12))
+summary(model)
+```
+
+Treningowe MAE sugeruje, że na zbiorze treningowym model myli się przeciętnie o około 355 jednostek, czyli o około 1,63% (MAPE).
+Sprawdzimy jeszcze istotność parametrów modelu.
+
+```{r}
+library(lmtest)
+coeftest(model)
+```
+
+Jak widać, jedynie niesezonowy parametr autoregresyjny okazuje się być istotny statystycznie na poziomie istotności 5%.
+Zatem na obserwację $y_t$ istotny wpływ ma obserwacja $y_{t-1}$, ale już nie $y_{t-2}$, $y_{t-3}$ czy $y_{t-4}$.
+Na poziomie istotności 10% moglibyśmy jeszcze wnioskować o wpływie błędu $\varepsilon_{t-2}$ na $y_t$.
+
+Spróbujmy wyestymować model AR(1), zawierający tylko parametr istotny statystycznie, aby porównać go z otrzymanym modelem SARIMA.
+
+```{r}
+model_ar1 <- Arima(train_data, order=c(1, 0, 0))
+summary(model_ar1)
+```
+
+Model AR(1) jest gorszy od otrzymanego wcześniej modelu SARIMA - ma wyższe wartości zarówno MAPE i RMSE, jak i kryteriów informacyjnych (AIC, BIC).
+
+Zatem najlepszy model to $SARIMA(4,1,2)(0,1,1)_{12}$, postaci: $y_t' = c + \phi_1 y_{t-1}' + \phi_2 y_{t-2}' + \phi_3 y_{t-3}' + \phi_4 y_{t-4}' + \varepsilon_t - \theta_1 \varepsilon_{t-1} -  \theta_2 \varepsilon_{t-2} + \Theta_1 \varepsilon_{t-12}$, gdzie $y_t'$ to wartość szeregu zróżnicowanego $d$ razy, $\phi_1... \phi_p$ to parametry części autoregresyjnej, $\theta_1... \theta_q$ to parametry przy błędach poprzednich predykcji (część niesezonowa), $\Theta_1$ odpowiada za uwzględnienie błędu predykcji sprzed 12 m-cy (część sezonowa).
+
+Sprawdzamy rozkład i autokorelację reszt dla najlepszego modelu.
+
+```{r}
+checkresiduals(model)
+```
+
+Wykres ACF pokazuje brak istotnej autokorelacji reszt w finalnym modelu - to pożądana własność.
+Potwierdza to też wysokie pvalue w teście Ljunga-Boxa (brak podstaw do odrzucenia $H_0$).
+
+Możemy również sprawdzić normalność reszt - wykorzystamy do tego test Shapiro-Wilka, w którym $H_0$: reszty mają rozkład normalny, $H_1$: reszty nie mają rozkładu normalnego.
+
+```{r}
+shapiro.test(model$residuals)
+```
+
+Na 5% poziomie istotności odrzucamy $H_0$ i wnioskujemy, że reszty nie mają rozkładu normalnego.
+
+Na koniec wizualizacja prognoz - zarówno in-sample, jak i out-of-sample.
+Na wykresie uwzględniamy rok 2020 - prognozy rozminęły się wtedy z rzeczywistością z uwagi na pandemię i obserwowany spadek przestępczości.
+
+```{r}
+# horyzont prognozy
+h <- 24
+   
+# prognoza out-of-sample            
+pred_values <- forecast(model, h=h)$mean
+
+# wektor połączonych prognoz in-sample i out-of-sample
+pred = c(fitted(model), pred_values)
+
+train_test_labels =  c(rep("train", times = length(train_data)), rep("test", times = h))
+
+df <- cbind(arima_data, pred, train_test_labels)
+
+ggplot(df, aes(x = Month, y = num_crimes)) + 
+  geom_point(color = "lightblue") + 
+  geom_line(color = "lightblue") + 
+  geom_point(aes(y = pred, alpha = train_test_labels), color = "red") + 
+  geom_line(aes(y = pred, linetype = train_test_labels, alpha = train_test_labels), color = "red") + 
+  scale_linetype_manual(values = c("train" = "solid", "test" = "dashed")) +
+  scale_alpha_manual(values = c("train" =  0.8, "test" =  0.5)) +
+  scale_y_continuous(limits = c(0, 26e3), breaks = seq(0, 25e3, 5e3), labels = function(x) x/1000) +
+  theme_bw() + 
+  labs(
+    title = "Miesięczna liczba przestępstw ogółem",
+    subtitle = "Prognoza vs prawdziwa wartość",
+    x = "Rok",
+    y = "Liczba przestępstw (tys.)",
+    alpha = "Typ prognozy",
+  )  + guides(linetype = "none")
+```
+
+# Rozdział III: Regresja logistyczna - kradzież a wtargnięcie na teren prywatny, Aleksander Jasiński
+
+## Ewaluacja modelu na oryginalnym zbiorze
+
+W naszym zbiorze danych uwzględnionych zostało aż 35 różnych rodzajów przestępstw.
+Różnice między częstością ich występowania są bardzo duże (np. *240 348 obserwacji dla `Battery` a 52 obserwacje dla `HUMAN TRAFFICKING`*).
+W związku z powyższym przefiltrumy nasze dane dla `Theft` oraz `CRIMINAL TRESPASS` i spróbujmy przeanalizować, w który **przypadek popełnienia przestępstwa częściej kończy się aresztowaniem**.
+
+```{r}
+theft_n_trespass <- dane %>% filter(Primary.Type %in% c("THEFT", "CRIMINAL TRESPASS"))%>% 
+  select(-c(X,Block,Case.Number, IUCR, Description, FBI.Code, Location.Description, X.Coordinate,Y.Coordinate,Location))%>%
+  mutate(Primary.Type = factor(Primary.Type),
+         Arrest = factor(Arrest))
+```
+
+Zauważmy, że nasze klasy są niezbilansowane i posiadamy kilkukrotnie razy więcej rekordów dla kradzieży.
+Żeby pozbyć się tego problemu przed zbudowaniem modelu treningowego wykonamy oversampling.
+
+```{r}
+theft_n_trespass <- theft_n_trespass %>%
+  mutate(
+    Hour = as.integer(substr(Date, 12, 13)),
+    part_of_day = case_when(
+      Hour >= 0  & Hour <= 5  ~ "noc",
+      Hour >= 6  & Hour <= 11 ~ "przedpoludnie",
+      Hour >= 12 & Hour <= 23 ~ "popoludnie"
+  ))
+```
+
+Przy okazji usuńmy niepotrzebne kolumny.
+
+Przejdźmy do przygotowania naszych zmiennych.
+Zmieńmy `chr` na odpowiednie typy do regresji, stworzymy w tym celu binarne zmienne bądź częśc z nich oznaczymy jako `factor`:
+
+```{r}
+model_dane <- theft_n_trespass %>%
+  mutate(
+    arrest_bin = if_else(Arrest == "True", 1, 0),
+    theft_vs_trespass = factor(Primary.Type,
+      levels = c("THEFT", "CRIMINAL TRESPASS")),
+    domestic = as.factor(if_else(Domestic == "True", 1, 0)),
+    district = as.factor(District),
+    year = as.factor(Year),
+    part_of_day = as.factor(part_of_day)
+  ) %>%
+  select(ID,Primary.Type,arrest_bin, theft_vs_trespass, domestic, district, year, part_of_day)
+```
+
+Nasz **model regresji logistycznej**:
+
+```{r}
+model <- glm(
+  arrest_bin ~ theft_vs_trespass + domestic + district + year+part_of_day,
+  data = model_dane,
+  family = binomial()
+)
+
+summary(model)
+```
+
+Nasza bazowa kategoria to `THEFT,`no domestic`,`district`oraz rok`2016\`.
+Wartość $Intercept = -1.695$, czyli w naszej podstawowej grupie szansa aresztowania wynosi $exp(-1.695$ tj. około $16%$.
+
+Sprawdźmy jak wygląda iloraz szansy w naszym modelu, czyli stosunek szansy wystąpienia danego zdarzenia w jednej grupie do szansy jego wystąpienia w innej grupie.
+
+```{r}
+exp(coef(model))
+```
+
+`Criminal Trespass` ma dużo większą szansę ($exp(2.484$) na aresztowanie niż `Theft`.
+Ponadto, wraz z biegiem lat szansa na aresztowanie lekko maleje.
+**Zauważmy nagły spadek szansy na aresztowanie dla roku 2020**, warto odnotować wystąpienie pandemii w tamtym okresie oraz zmiany polityki ze względu na wydarzenia takie jak chociażby śmierć Georga Floyda, dla ujednolicenia naszej analizy przefiltrujemy pracując na modelu wykluczającym rok 2020.
+
+Sprawdźmy zmienną `district31`, która ma podejrzanie niską wartość.
+
+```{r}
+model_dane %>% filter(district==31)
+```
+
+Zmienna posiada tylko kilka obserwacji, w celu poprawienia naszego modelu usuńmy je.
+
+```{r}
+model_dane <- model_dane  %>% filter(district!=31) 
+```
+
+## Testowanie modelu na zbiorze treningowym oraz testowym
+
+Chcąc dalej sprawdzać skuteczności naszego modelu podzielmy zbiór `model_data` na podzbiór treningowy (70%) oraz podzbiór testowy (30%).
+
+```{r}
+dane_train <- model_dane %>% slice_sample(prop=0.7)
+dane_test <- model_dane %>% anti_join(dane_train, by="ID")
+```
+
+W tym momencie wykonamy oversampling dla naszego zbioru treningowego, czyli uzupełnimy go wieloma kopiami brakującej klasy mniejszościowej (u nas `CRIMINAL TRESPASS`).Nasz **zbiór testowy powinien zawierać wyłącznie dane rzeczywiste**, bez żadnych modyfikacji - wyłącznie w takim wypadku możemy faktycznie sprawdzić skuteczność naszego modelu.
+Do zaniechania niezbilansowania naszych klas wykorzystam bibliotekę `ROSE`:
+
+```{r}
+set.seed(123)
+library(ROSE)
+
+dane_train <- ovun.sample(
+  Primary.Type~.,
+  data = dane_train,
+  method = "over",
+  N=100000+sum(dane_train$Primary.Type == "THEFT")
+)$data
+table(dane_train$Primary.Type)
+```
+
+Dzięki oversamplingowi nasze klasy są o wiele lepiej zbalansowane.
+Możemy przejść do dalszego estymowania modelu.
+
+Przetrenujmy model na **zbiorze treningowym**, a następnie sprawdźmy jego skuteczność na zbiorze testowym.
+
+```{r}
+model <- glm(
+  arrest_bin ~ theft_vs_trespass + domestic + district + year+part_of_day,
+  data = dane_train,
+  family = binomial(link="logit")
+)
+
+```
+
+Jeśli chcemy otrzymać prawdopodobieństwo aresztowania ustawmy `type` na *response*:
+
+```{r}
+p_test <- predict(model, dane_test, type="response")
+```
+
+Jeśli prawdopobieństwo aresztowania jest większe niż 0.5 ustawmy wartość 1, w przeciwnym razie niech będzie to 0.
+
+```{r}
+p_val <- ifelse(p_test > 0.5, 1, 0)
+```
+
+```{r}
+mean(p_val == dane_test$arrest_bin)
+```
+
+```{r}
+ct<-table(real=dane_test$arrest_bin,pred=p_val)
+ct
+```
+
+Dokładność na poziomie $87.7%$ świadczy o skuteczności modelu.
+Warto zauważyć jednak dysproporcję w przyporządkowanych aresztowaniach - jest ich o wiele mniej niż faktycznych przypadków - powinniśmy zastanowić się z czego to wynika.
+Głównym czynnikiem wpływającym na to jest rozkład badanych danych.
+
+Zdecydowanie **więcej aresztowań występuje w przypadku włamań niż w przypadku kradzieży** (gdzie `Theft` oznacza, że w trakcie dokonywania kradzieży nie użyto siły/przemocy - jest to czyn łagodniejszego formatu niż np. `Robbery`).
+
+W celu sprawdzenia wydajności naszego modelu zwizualizujmy i policzmy sobie ROC (krzywa charakterystyki operacyjnej odbiornika).
+
+```{r}
+library(pROC)
+
+roc_theft_n_trespass <- roc(dane_test$arrest_bin, p_test)
+plot(roc_theft_n_trespass)
+```
+
+Obszar pod naszą krzywą AUC (area under curve) wynosi:
+
+```{r}
+auc(roc_theft_n_trespass)
+```
+
+Jest to przyzwoity wynik i oznacza dopuszczalną (średnią) jakość klasyfikatora.
+AUC dla w pełni losowego modelu wynosi 0.5.
+Nasz model dla każdego indywidualnego przypadku z lekko ponad $71%$ pewnościa przewidzi, czy wystąpi aresztowanie.
+
+```{r}
+#dokladnosc 
+acc<- (ct[1,1]+ct[2,2])/sum(ct)
+acc
+
+#czulosc
+sens <- ct[2,2]/(ct[2,1]+ct[2,2])
+sens
+
+#swoistosc
+
+spe <- ct[1,1]/(ct[1,1]+ct[1,2])
+spe
+#precyzja
+pre <- ct[2,2]/(ct[2,2]+ct[1,2])
+pre
+```
+
+Nasz model cierpi na przypadek niskiej czułości dla klasy `CRIMINAL TRESPASS` (tylko $31%$), przy takim wyniku ignoruje on większość przypadków klasy mniejszościowej.
+Dzięki wysokiej swoistości bardzo dobrze przewiduje klasę `THEFT`
+
+### Obliczanie nowego progu klasyfikacji
+
+Model mimo wszystko jest bardzo konserwatywny, wykrywa tylko **te aresztowania, co do których jest niemal pewny** - kosztem mniej oczywistych przypadków - False Negatives.
+Możemy to poprawic zmieniający próg, przy którym nasz model przypiuje aresztowanie (aktualnie było to 0.5 tzn. jeśli prawdopobieństwo aresztowania było większe niż 50% to je odnotywaliśmy).
+
+Znajdźmy optymalny próg:
+
+```{r}
+coords(roc_theft_n_trespass, "best", ret = "threshold")
+```
+
+Ustawmy go jako 0.14.
+
+```{r}
+p_val_opt <- ifelse(p_test > 0.14, 1, 0)
+ct_opt <- table(real = dane_test$arrest_bin, pred = p_val_opt)
+ct_opt
+```
+
+Otrzymujemy inne wyniki.
+
+```{r}
+#dokladnosc 
+acc<- (ct_opt[1,1]+ct_opt[2,2])/sum(ct_opt)
+acc
+
+#czulosc
+sens <- ct_opt[2,2]/(ct_opt[2,1]+ct_opt[2,2])
+sens
+
+#swoistosc
+
+spe <- ct_opt[1,1]/(ct_opt[1,1]+ct_opt[1,2])
+spe
+#precyzja
+pre <- ct_opt[2,2]/(ct_opt[2,2]+ct_opt[1,2])
+pre
+
+```
+
+Zauważalne są pewne **zmiany w wartościach**.
+Przede wszystkim czułość podskoczyła aż do $0.49$, w pozostałych statystykach zauważalny jest lekki spadek.
+Dopiero teraz model przestał ignorować klasę mniejszościową.
+
+```{r}
+f1 <- 2 * (pre * sens) / (pre + sens)
+f1
+```
+
+`F1 score` równy 0.4 wydaje się być umiarkowanym wynikiem.
+
+Model **wykazuje pewną zdolność rozróżniania między naszymi klasami**, lecz jego skuteczność w wykrywaniu przypadków klasy mniejszościowej pozostaje ograniczona.
+Możliwa jest poprawa jakości predykcji poprzez zastosowanie bardziej zaawansowanych modeli, takich jak las losowy (`randomForest`), gradient boosting (`xgboost`) lub modele z ważeniem klas.
+Poprawę również może przynieść rozszerzenie zbioru danych o nowe zmienne niezależne bądź kontekst społeczno-demograficzny (np. gęstość zaludnienia, poziom bezrobocia, wskaźniki ubóstwa w okolicy)
+
+## Wizualizacja odsetka aresztowań dla roku 2018
+
+Dla zachowania sensu naszej analizy przefiltrujmy dane dla roku 2018 i przeanalizujmy wykroczenia zakończone aresztowaniem na obszarze Chicago (analiza pod kątem szeregu czasowego oraz sezonowosći, `ARIMA` oraz `SARIMA`, uwzględniona została w części przygotowanej przez Piotrka).
+
+Sprawdźmy jak wygląda rozmieszczenie aresztowań z podziałem na dzielnice Chicago.
+Wykorzystamy do tego pakiet `OpenStreetMap` oraz `sf`:
+
+```{r}
+library(sf)
+mapa_theft <- theft_n_trespass %>% inner_join(dane_test, by="ID")%>%filter(Year==2018, Arrest=="True", 
+                                                                            Primary.Type.x == "THEFT")
+mapa_trespass <- theft_n_trespass %>% inner_join(dane_test, by="ID")%>%filter(Year==2018 & Arrest=="True" 
+                                                                              & Primary.Type.x == "CRIMINAL TRESPASS")
+
+mapa_theft <- mapa_theft[!is.na(mapa_theft$Longitude),]
+mapa_trespass <- mapa_trespass[!is.na(mapa_trespass$Longitude),]
+
+mapa_trespass <-st_as_sf(mapa_trespass, coords = c("Longitude", "Latitude"), crs = 4326)
+mapa_theft <-st_as_sf(mapa_theft, coords = c("Longitude", "Latitude"), crs = 4326)
+```
+
+Pobranie mapy Chicago:
+
+```{r}
+library(rJava)
+library(OpenStreetMap)
+
+upperLeft = c(42.037, -87.975)
+
+lowerRight = c(41.637, -87.473)
+
+base_map  = openmap(upperLeft, lowerRight, type="osm")
+```
+
+```{r}
+plot(base_map)
+
+mapa_theft.osm <- st_transform(mapa_theft, osm())
+
+plot(st_geometry(mapa_theft.osm), pch=16, col="#80000010", add=T)
+
+```
+
+Wraz ze zbliżaniem się do linii brzegowej Chicago zwiększa się zagęszczenie aresztowań za kradzież.
+Zaraz spradzimy na obszarach jakich dystryktów występuje najwięcej przestępstw.
+
+```{r}
+plot(base_map)
+
+mapa_trespass.osm <- st_transform(mapa_trespass, osm())
+
+plot(st_geometry(mapa_trespass.osm), pch=16, col="#80000010", add=T)
+
+```
+
+W przypadku włamań na posesje prywatną skalowanie się ilości aresztowań wraz ze zbliżaniem się do linii brzegowej nie jest tak samo ujednolicone.
+Pamiętajmy również, że rekordów dla kradzieży w naszym zbiorze jest kilkanaście razy więcej - nie oznacza to jednak że kradzież częściej skutkuje aresztowaniem (odwrotne wnioski zaprezentował nasz model, dlatego to właśnie od jego budowy rozpocząłem nasza pracę).
+
+Dodatkowo, zrzutujmy sobie na mapie poszczególne dystrykty:
+
+```{r}
+districts_csv <- read.csv("PoliceDistrictDec2012_20250508.csv", stringsAsFactors = FALSE)
+districts_sf <- st_as_sf(districts_csv, wkt = "the_geom", crs = 4326)
+districts_osm <- st_transform(districts_sf, osm())
+districts_centroids <- st_centroid(districts_osm)
+```
+
+```{r}
+plot(base_map)
+plot(st_geometry(districts_osm), border = "black", add = TRUE)
+plot(st_geometry(mapa_theft.osm), pch=16, col="#80000010", add=T)
+text(
+  x = st_coordinates(districts_centroids)[, 1],
+  y = st_coordinates(districts_centroids)[, 2],
+  labels = districts_centroids$DIST_NUM,
+  col = "blue",
+  cex = 0.8,
+  font = 2,
+  title("Aresztowania w związku z kradzieżą")
+)
+```
+
+```{r}
+plot(base_map)
+plot(st_geometry(districts_osm), border = "black", add = TRUE)
+plot(st_geometry(mapa_trespass.osm), pch=16, col="#80000010", add=T)
+text(
+  x = st_coordinates(districts_centroids)[, 1],
+  y = st_coordinates(districts_centroids)[, 2],
+  labels = districts_centroids$DIST_NUM,
+  col = "blue",
+  cex = 0.8,
+  font = 2,
+  title("Aresztowania w związku z włamaniami")
+  )
+
+
+```
+
+Rozłożenie aresztowań w zależności od *popełnionego przestępstwa różni się od siebie*, mimo to z naszej mapy możemy odczytać, że w roku 2018 największe zagęszczenie aresztowań **odnotowano w dystrykcie 1, 18 oraz 19, przy brzegu Chicago**, czyli miejscu atrakcyjnym turystycznie.
+Dużo mniej przestępstw popełniono na obrzeżach miasta.
+
+-   W przypadku kradzieży, obserwuje się wyraźne skupienie aresztowań w centralnych i komercyjnych dzielnicach Chicago
+-   Wykres może sugerować, że **kradzieże są zjawiskiem bardziej oportunistycznym, związanym z obecnością dużych skupisk ludzi i turystów**, a włamania częściej dotyczą mniej zurbanizowanych, mieszkalnych części miasta.
+
+Sprawdźmy odsetek aresztowań na dany dystrykt w 2018:
+
+```{r}
+ model_dane %>% filter(year==2018)%>%group_by(district, Primary.Type) %>%
+  summarize(n_przestepstw=mean(arrest_bin==1))%>%
+  ggplot(aes(district,n_przestepstw))+
+  geom_bar(stat="identity", fill="lightblue")+
+  facet_wrap(~Primary.Type)+
+  labs(
+    title = "Odsetek aresztowań w 2018",
+    x = "Dystrykt",
+    y = "Ilość zarejstrowanych przestępstw"
+  )+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold"))
+```
+
+Wykres przedstawia udział przestępstw zakończonych aresztowaniem w podziale na dystrykty, tak jak pokazał nasz model `Criminal Trespass` ma znacznie wyższy odsetek aresztowań we wszystkich dystryktach.
+
+Jeśli wrócimy do naszej wcześniej mapy zauważymy, że wtargnięcia są rozproszone, ale widocznie nasilone w **południowych i zachodnich dzielnicach**, kradzieże koncentrują się w **centralnych i północno-wschodnich dzielnicach**.
+
+Analiza wskazuje, że kradzieże mają charakter bardziej skoncentrowany i występują głównie w centralnych dzielnicach Chicago, podczas gdy włamania charakteryzują się większym rozproszeniem i częściej pojawiają się w dzielnicach peryferyjnych.
+Na rozłożenie aresztowań może mieć również wpływ polityka oraz "surowość" dystryktu, który poszczególny obszar nadzoruje, a ich rozkład może odzwierciedlać różnice w sposobie popełniania tych przestępstw oraz w ich motywacjach społeczno-ekonomicznych.
+Mimo wszystko, do stwierdzenia tego potrzebowalibysmy wykonania dodatkowych testów statystycznych, które wymagałyby szersezgo zbioru danych - dlatego tę część pracy możemy potraktować w kategoriach ciekawostki.
